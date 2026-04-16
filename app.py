@@ -20,6 +20,20 @@ DICT_PATH   = BASE_DIR / "dictionary.db"
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "lugat_admin_2024")
 
 
+SERVER_SALT = "lugat_server_users_2024"
+
+def _hash_pw(password: str) -> str:
+    return hashlib.sha256(f"{SERVER_SALT}{password}".encode()).hexdigest()
+
+def require_admin(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get("X-Admin-Token", "")
+        if token != ADMIN_TOKEN:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
 def get_db():
     if "db" not in g:
         conn = sqlite3.connect(DB_PATH)
@@ -73,6 +87,16 @@ def init_db():
             release_note    TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_words(status);
+        CREATE TABLE IF NOT EXISTS server_users (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            username     TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role         TEXT DEFAULT 'editor',
+            full_name    TEXT DEFAULT '',
+            is_active    INTEGER DEFAULT 1,
+            created_at   TEXT DEFAULT (datetime('now')),
+            last_login   TEXT DEFAULT NULL
+        );
     """)
     # Если dictionary.db есть — создаём начальную версию
     row = conn.execute("SELECT COUNT(*) FROM dict_versions").fetchone()[0]
@@ -368,7 +392,201 @@ def get_stats():
     })
 
 
+# ── Управление пользователями ────────────────────────────────────────────────
+
+@app.route("/api/users/login", methods=["POST"])
+def user_login():
+    """Авторизация редактора/администратора через сервер."""
+    data = request.get_json(force=True, silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+    if not username or not password:
+        return jsonify({"ok": False, "error": "Укажите логин и пароль"}), 400
+
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM server_users WHERE username=? AND password_hash=? AND is_active=1",
+        (username, _hash_pw(password))
+    ).fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "Неверный логин или пароль"}), 401
+
+    # Обновляем last_login
+    db.execute(
+        "UPDATE server_users SET last_login=datetime('now') WHERE id=?",
+        (row["id"],)
+    )
+    db.commit()
+
+    return jsonify({
+        "ok": True,
+        "username": row["username"],
+        "role": row["role"],
+        "full_name": row["full_name"],
+    })
+
+
+@app.route("/api/users/list", methods=["GET"])
+@require_admin
+def user_list():
+    """Список всех пользователей (только для admin)."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, username, role, full_name, is_active, created_at, last_login "
+        "FROM server_users ORDER BY created_at DESC"
+    ).fetchall()
+    return jsonify({"ok": True, "users": [dict(r) for r in rows]})
+
+
+@app.route("/api/users/create", methods=["POST"])
+@require_admin
+def user_create():
+    """Создать нового пользователя."""
+    data = request.get_json(force=True, silent=True) or {}
+    username  = data.get("username", "").strip()
+    password  = data.get("password", "")
+    role      = data.get("role", "editor")
+    full_name = data.get("full_name", "").strip()
+
+    if not username or not password:
+        return jsonify({"ok": False, "error": "Укажите логин и пароль"}), 400
+    if role not in ("admin", "editor"):
+        role = "editor"
+
+    db = get_db()
+    try:
+        db.execute(
+            "INSERT INTO server_users (username, password_hash, role, full_name) "
+            "VALUES (?, ?, ?, ?)",
+            (username, _hash_pw(password), role, full_name)
+        )
+        db.commit()
+        return jsonify({"ok": True, "message": f"Пользователь {username!r} создан"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Пользователь уже существует: {e}"}), 409
+
+
+@app.route("/api/users/update", methods=["POST"])
+@require_admin
+def user_update():
+    """Изменить роль, пароль или активность пользователя."""
+    data    = request.get_json(force=True, silent=True) or {}
+    user_id = data.get("user_id")
+    db      = get_db()
+
+    if "password" in data and data["password"]:
+        db.execute(
+            "UPDATE server_users SET password_hash=? WHERE id=?",
+            (_hash_pw(data["password"]), user_id)
+        )
+    if "role" in data:
+        db.execute("UPDATE server_users SET role=? WHERE id=?", (data["role"], user_id))
+    if "is_active" in data:
+        db.execute("UPDATE server_users SET is_active=? WHERE id=?",
+                   (1 if data["is_active"] else 0, user_id))
+    if "full_name" in data:
+        db.execute("UPDATE server_users SET full_name=? WHERE id=?",
+                   (data["full_name"], user_id))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/delete", methods=["POST"])
+@require_admin
+def user_delete():
+    """Удалить пользователя."""
+    data    = request.get_json(force=True, silent=True) or {}
+    user_id = data.get("user_id")
+    db      = get_db()
+    db.execute("DELETE FROM server_users WHERE id=?", (user_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+# ── Управление пользователями (удалённая синхронизация) ───────────────────────
+
+@app.route("/api/users", methods=["GET"])
+@require_admin
+def get_users():
+    """Получить список пользователей (для синхронизации клиентов)."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT username, password_hash, role FROM remote_users ORDER BY username"
+    ).fetchall()
+    return jsonify({"users": [dict(r) for r in rows]})
+
+
+@app.route("/api/users/sync", methods=["POST"])
+@require_admin
+def sync_users():
+    """
+    Принять список пользователей от admin-клиента.
+    Полностью заменяет список на сервере.
+    Body: {"users": [{"username": ..., "password_hash": ..., "role": ...}]}
+    """
+    data  = request.get_json(force=True) or {}
+    users = data.get("users", [])
+
+    db = get_db()
+    # Создаём таблицу если нет
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS remote_users (
+            username      TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role          TEXT DEFAULT 'editor',
+            synced_at     TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Удаляем всех кроме admin
+    db.execute("DELETE FROM remote_users WHERE username != 'admin'")
+    # Вставляем/обновляем
+    added = 0
+    for u in users:
+        uname = u.get("username", "").strip()
+        phash = u.get("password_hash", "").strip()
+        role  = u.get("role", "editor")
+        if uname and phash:
+            db.execute("""
+                INSERT OR REPLACE INTO remote_users (username, password_hash, role, synced_at)
+                VALUES (?, ?, ?, datetime('now'))
+            """, (uname, phash, role))
+            added += 1
+    db.commit()
+    return jsonify({"ok": True, "synced": added})
+
+
+@app.route("/api/users/check", methods=["POST"])
+def check_user():
+    """
+    Проверить логин/пароль пользователя (для удалённого входа).
+    Не требует admin-токен — нужен только username+password_hash.
+    Body: {"username": ..., "password_hash": ...}
+    """
+    data  = request.get_json(force=True) or {}
+    uname = data.get("username", "").strip()
+    phash = data.get("password_hash", "").strip()
+
+    if not uname or not phash:
+        return jsonify({"ok": False, "error": "Missing credentials"}), 400
+
+    db = get_db()
+    # Создаём таблицу если нет
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS remote_users (username TEXT PRIMARY KEY, password_hash TEXT, role TEXT DEFAULT 'editor', synced_at TEXT)")
+        row = db.execute(
+            "SELECT role FROM remote_users WHERE username=? AND password_hash=?",
+            (uname, phash)
+        ).fetchone()
+    except Exception:
+        row = None
+
+    if row:
+        return jsonify({"ok": True, "role": row["role"]})
+    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
