@@ -25,15 +25,6 @@ SERVER_SALT = "lugat_server_users_2024"
 def _hash_pw(password: str) -> str:
     return hashlib.sha256(f"{SERVER_SALT}{password}".encode()).hexdigest()
 
-def require_admin(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get("X-Admin-Token", "")
-        if token != ADMIN_TOKEN:
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
-
 def get_db():
     if "db" not in g:
         conn = sqlite3.connect(DB_PATH)
@@ -87,6 +78,13 @@ def init_db():
             release_note    TEXT DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_words(status);
+        CREATE TABLE IF NOT EXISTS notifications (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            title      TEXT NOT NULL,
+            message    TEXT NOT NULL,
+            target     TEXT DEFAULT 'all',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS server_users (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             username     TEXT NOT NULL UNIQUE,
@@ -502,6 +500,61 @@ def user_delete():
     db.execute("DELETE FROM server_users WHERE id=?", (user_id,))
     db.commit()
     return jsonify({"ok": True})
+
+
+# ── Уведомления ──────────────────────────────────────────────────────────────
+
+@app.route("/api/notifications/send", methods=["POST"])
+@require_admin
+def notifications_send():
+    data    = request.get_json(force=True, silent=True) or {}
+    title   = str(data.get("title",   "")).strip()
+    message = str(data.get("message", "")).strip()
+    target  = str(data.get("target",  "all")).strip()
+    if not title or not message:
+        return jsonify({"ok": False, "error": "Заголовок и текст обязательны"}), 400
+    if target not in ("all", "editors", "admins"):
+        target = "all"
+    db = get_db()
+    db.execute(
+        "INSERT INTO notifications (title, message, target) VALUES (?, ?, ?)",
+        (title, message, target)
+    )
+    db.commit()
+    return jsonify({"ok": True, "message": "Уведомление отправлено"})
+
+
+@app.route("/api/notifications/list", methods=["GET"])
+@require_admin
+def notifications_list():
+    db   = get_db()
+    rows = db.execute(
+        "SELECT id, title, message, target, created_at FROM notifications "
+        "ORDER BY created_at DESC LIMIT 100"
+    ).fetchall()
+    return jsonify({"ok": True, "notifications": [dict(r) for r in rows]})
+
+
+@app.route("/api/notifications", methods=["GET"])
+def get_notifications():
+    role = request.args.get("role", "all")
+    db   = get_db()
+    if role == "admin":
+        rows = db.execute(
+            "SELECT id, title, message, target, created_at FROM notifications "
+            "ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    elif role == "editor":
+        rows = db.execute(
+            "SELECT id, title, message, target, created_at FROM notifications "
+            "WHERE target IN ('all', 'editors') ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, title, message, target, created_at FROM notifications "
+            "WHERE target = 'all' ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    return jsonify({"notifications": [dict(r) for r in rows]})
 
 
 if __name__ == "__main__":
