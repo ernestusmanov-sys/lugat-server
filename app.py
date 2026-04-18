@@ -4,9 +4,11 @@ Lügat — Центральный сервер краудсорсинга
 import os
 import hashlib
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from functools import wraps
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from flask import Flask, request, jsonify, send_file, g
 from flask_cors import CORS
@@ -15,22 +17,55 @@ app = Flask(__name__)
 CORS(app)
 
 BASE_DIR    = Path(__file__).parent
-DB_PATH     = BASE_DIR / "lugat_server.db"
 DICT_PATH   = BASE_DIR / "dictionary.db"
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "lugat_admin_2024")
-
+# Supabase / any PostgreSQL — replace "postgres://" prefix for psycopg2 compatibility
+DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 
 SERVER_SALT = "lugat_server_users_2024"
+
 
 def _hash_pw(password: str) -> str:
     return hashlib.sha256(f"{SERVER_SALT}{password}".encode()).hexdigest()
 
-def get_db():
+
+def _row(r) -> dict:
+    """Convert RealDictRow to JSON-serializable dict (timestamps → ISO strings)."""
+    if r is None:
+        return None
+    d = dict(r)
+    for k, v in d.items():
+        if hasattr(v, "isoformat"):
+            d[k] = v.isoformat()
+    return d
+
+
+def _rows(rs) -> list:
+    return [_row(r) for r in rs]
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+class _DB:
+    """Wraps psycopg2 connection with a sqlite3-like execute() interface."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
+def get_db() -> _DB:
     if "db" not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        g.db = conn
+        g.db = _DB(psycopg2.connect(DATABASE_URL))
     return g.db
 
 
@@ -38,77 +73,98 @@ def get_db():
 def close_db(exc):
     db = g.pop("db", None)
     if db:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript("""
-        PRAGMA foreign_keys = ON;
+    conn = psycopg2.connect(DATABASE_URL)
+    cur  = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_words (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            word            TEXT NOT NULL,
-            translation     TEXT NOT NULL,
-            example         TEXT DEFAULT '',
-            locality        TEXT DEFAULT '',
-            speaker         TEXT DEFAULT '',
-            contributor     TEXT DEFAULT '',
-            contact         TEXT DEFAULT '',
-            direction       TEXT DEFAULT 'ct_ru',
-            status          TEXT DEFAULT 'pending',
-            reject_reason   TEXT DEFAULT '',
-            submitted_at    TEXT DEFAULT (datetime('now')),
-            moderated_at    TEXT DEFAULT NULL,
-            ip_address      TEXT DEFAULT ''
-        );
+            id            SERIAL PRIMARY KEY,
+            word          TEXT NOT NULL,
+            translation   TEXT NOT NULL,
+            example       TEXT DEFAULT '',
+            locality      TEXT DEFAULT '',
+            speaker       TEXT DEFAULT '',
+            contributor   TEXT DEFAULT '',
+            contact       TEXT DEFAULT '',
+            direction     TEXT DEFAULT 'ct_ru',
+            status        TEXT DEFAULT 'pending',
+            reject_reason TEXT DEFAULT '',
+            submitted_at  TIMESTAMP DEFAULT NOW(),
+            moderated_at  TIMESTAMP DEFAULT NULL,
+            ip_address    TEXT DEFAULT ''
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS moderation_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            word_id     INTEGER,
-            action      TEXT,
-            admin_note  TEXT DEFAULT '',
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+            id         SERIAL PRIMARY KEY,
+            word_id    INTEGER,
+            action     TEXT,
+            admin_note TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS dict_versions (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            version         INTEGER NOT NULL UNIQUE,
-            words_count     INTEGER DEFAULT 0,
-            db_size_bytes   INTEGER DEFAULT 0,
-            db_hash         TEXT DEFAULT '',
-            released_at     TEXT DEFAULT (datetime('now')),
-            release_note    TEXT DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_words(status);
+            id            SERIAL PRIMARY KEY,
+            version       INTEGER NOT NULL UNIQUE,
+            words_count   INTEGER DEFAULT 0,
+            db_size_bytes INTEGER DEFAULT 0,
+            db_hash       TEXT DEFAULT '',
+            released_at   TIMESTAMP DEFAULT NOW(),
+            release_note  TEXT DEFAULT ''
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_words(status)")
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         SERIAL PRIMARY KEY,
             title      TEXT NOT NULL,
             message    TEXT NOT NULL,
             target     TEXT DEFAULT 'all',
-            created_at TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS server_users (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            username     TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role         TEXT DEFAULT 'editor',
-            full_name    TEXT DEFAULT '',
-            is_active    INTEGER DEFAULT 1,
-            created_at   TEXT DEFAULT (datetime('now')),
-            last_login   TEXT DEFAULT NULL
-        );
+            created_at TIMESTAMP DEFAULT NOW()
+        )
     """)
-    # Если dictionary.db есть — создаём начальную версию
-    row = conn.execute("SELECT COUNT(*) FROM dict_versions").fetchone()[0]
-    if row == 0 and DICT_PATH.exists():
-        size = DICT_PATH.stat().st_size
-        hsh  = _file_hash(DICT_PATH)
-        wc   = _word_count()
-        conn.execute(
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS server_users (
+            id            SERIAL PRIMARY KEY,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role          TEXT DEFAULT 'editor',
+            full_name     TEXT DEFAULT '',
+            is_active     SMALLINT DEFAULT 1,
+            created_at    TIMESTAMP DEFAULT NOW(),
+            last_login    TIMESTAMP DEFAULT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS remote_users (
+            username      TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role          TEXT DEFAULT 'editor',
+            synced_at     TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    # Initial dict version if dictionary.db is present
+    cur.execute("SELECT COUNT(*) FROM dict_versions")
+    if cur.fetchone()[0] == 0 and DICT_PATH.exists():
+        wc = _word_count()
+        cur.execute(
             "INSERT INTO dict_versions (version, words_count, db_size_bytes, db_hash, release_note) "
-            "VALUES (1,?,?,?,'Начальная версия')", (wc, size, hsh)
+            "VALUES (1, %s, %s, %s, 'Начальная версия')",
+            (wc, DICT_PATH.stat().st_size, _file_hash(DICT_PATH))
         )
     conn.commit()
+    cur.close()
     conn.close()
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _file_hash(path):
     h = hashlib.sha256()
@@ -165,7 +221,7 @@ def get_version():
         "words_count": row["words_count"],
         "db_size":     row["db_size_bytes"],
         "db_hash":     row["db_hash"],
-        "released_at": row["released_at"],
+        "released_at": row["released_at"].isoformat() if row["released_at"] else "",
         "db_ready":    DICT_PATH.exists(),
     })
 
@@ -200,21 +256,22 @@ def submit_word():
     ip  = request.remote_addr or ""
     db  = get_db()
     dup = db.execute(
-        "SELECT id FROM pending_words WHERE word=? COLLATE NOCASE AND ip_address=? "
-        "AND submitted_at > datetime('now','-5 minutes')", (word, ip)
+        "SELECT id FROM pending_words WHERE LOWER(word)=LOWER(%s) AND ip_address=%s "
+        "AND submitted_at > NOW() - INTERVAL '5 minutes'",
+        (word, ip)
     ).fetchone()
     if dup:
         return jsonify({"error": "Это слово уже было отправлено недавно"}), 429
     db.execute(
-        "INSERT INTO pending_words (word,translation,example,locality,speaker,"
-        "contributor,contact,direction,ip_address) VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO pending_words (word, translation, example, locality, speaker, "
+        "contributor, contact, direction, ip_address) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (word, translation,
-         str(data.get("example","")).strip(),
-         str(data.get("locality","")).strip(),
-         str(data.get("speaker","")).strip(),
-         str(data.get("contributor","")).strip(),
-         str(data.get("contact","")).strip(),
-         str(data.get("direction","ct_ru")),
+         str(data.get("example",     "")).strip(),
+         str(data.get("locality",    "")).strip(),
+         str(data.get("speaker",     "")).strip(),
+         str(data.get("contributor", "")).strip(),
+         str(data.get("contact",     "")).strip(),
+         str(data.get("direction",   "ct_ru")),
          ip)
     )
     db.commit()
@@ -231,13 +288,13 @@ def get_pending():
     offset = int(request.args.get("offset", 0))
     db     = get_db()
     rows   = db.execute(
-        "SELECT * FROM pending_words WHERE status=? ORDER BY submitted_at DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM pending_words WHERE status=%s ORDER BY submitted_at DESC LIMIT %s OFFSET %s",
         (status, limit, offset)
     ).fetchall()
     total = db.execute(
-        "SELECT COUNT(*) FROM pending_words WHERE status=?", (status,)
-    ).fetchone()[0]
-    return jsonify({"total": total, "items": [dict(r) for r in rows]})
+        "SELECT COUNT(*) as n FROM pending_words WHERE status=%s", (status,)
+    ).fetchone()["n"]
+    return jsonify({"total": total, "items": _rows(rows)})
 
 
 @app.route("/api/approve/<int:word_id>", methods=["POST"])
@@ -245,7 +302,7 @@ def get_pending():
 def approve_word(word_id):
     db  = get_db()
     row = db.execute(
-        "SELECT * FROM pending_words WHERE id=? AND status='pending'", (word_id,)
+        "SELECT * FROM pending_words WHERE id=%s AND status='pending'", (word_id,)
     ).fetchone()
     if not row:
         return jsonify({"error": "Не найдено"}), 404
@@ -253,18 +310,19 @@ def approve_word(word_id):
         return jsonify({"error": "dictionary.db не загружен на сервер"}), 500
     try:
         dc = sqlite3.connect(DICT_PATH)
+        dc.row_factory = sqlite3.Row
         entry_lang = "ru" if row["direction"] == "ru_ct" else "ct"
         ex = dc.execute(
             "SELECT id FROM words WHERE crimean_tatar=? COLLATE NOCASE", (row["word"],)
         ).fetchone()
         if ex:
             dc.execute(
-                "UPDATE words SET russian=?,definition_ct=?,tags=? WHERE id=?",
+                "UPDATE words SET russian=?, definition_ct=?, tags=? WHERE id=?",
                 (row["translation"], row["example"], row["locality"], ex["id"])
             )
         else:
             dc.execute(
-                "INSERT INTO words (crimean_tatar,russian,definition_ct,tags,entry_lang) "
+                "INSERT INTO words (crimean_tatar, russian, definition_ct, tags, entry_lang) "
                 "VALUES (?,?,?,?,?)",
                 (row["word"], row["translation"], row["example"], row["locality"], entry_lang)
             )
@@ -277,14 +335,14 @@ def approve_word(word_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     db.execute(
-        "UPDATE pending_words SET status='approved',moderated_at=datetime('now') WHERE id=?",
+        "UPDATE pending_words SET status='approved', moderated_at=NOW() WHERE id=%s",
         (word_id,)
     )
-    last = db.execute("SELECT COALESCE(MAX(version),0) FROM dict_versions").fetchone()[0]
+    last  = db.execute("SELECT COALESCE(MAX(version),0) as v FROM dict_versions").fetchone()["v"]
     new_v = last + 1
     db.execute(
-        "INSERT INTO dict_versions (version,words_count,db_size_bytes,db_hash,release_note) "
-        "VALUES (?,?,?,?,?)",
+        "INSERT INTO dict_versions (version, words_count, db_size_bytes, db_hash, release_note) "
+        "VALUES (%s, %s, %s, %s, %s)",
         (new_v, _word_count(), DICT_PATH.stat().st_size,
          _file_hash(DICT_PATH), f"Одобрено: {row['word']}")
     )
@@ -297,15 +355,15 @@ def approve_word(word_id):
 def reject_word(word_id):
     db     = get_db()
     row    = db.execute(
-        "SELECT id FROM pending_words WHERE id=? AND status='pending'", (word_id,)
+        "SELECT id FROM pending_words WHERE id=%s AND status='pending'", (word_id,)
     ).fetchone()
     if not row:
         return jsonify({"error": "Не найдено"}), 404
     data   = request.get_json(force=True, silent=True) or {}
-    reason = str(data.get("reason","")).strip()
+    reason = str(data.get("reason", "")).strip()
     db.execute(
-        "UPDATE pending_words SET status='rejected',reject_reason=?,"
-        "moderated_at=datetime('now') WHERE id=?", (reason, word_id)
+        "UPDATE pending_words SET status='rejected', reject_reason=%s, moderated_at=NOW() WHERE id=%s",
+        (reason, word_id)
     )
     db.commit()
     return jsonify({"ok": True})
@@ -316,14 +374,14 @@ def reject_word(word_id):
 def publish_version():
     if not DICT_PATH.exists():
         return jsonify({"error": "dictionary.db не найден"}), 404
-    db      = get_db()
-    last    = db.execute("SELECT COALESCE(MAX(version),0) FROM dict_versions").fetchone()[0]
-    new_v   = last + 1
-    data    = request.get_json(force=True, silent=True) or {}
-    note    = str(data.get("note","Ручная публикация")).strip()
+    db    = get_db()
+    last  = db.execute("SELECT COALESCE(MAX(version),0) as v FROM dict_versions").fetchone()["v"]
+    new_v = last + 1
+    data  = request.get_json(force=True, silent=True) or {}
+    note  = str(data.get("note", "Ручная публикация")).strip()
     db.execute(
-        "INSERT INTO dict_versions (version,words_count,db_size_bytes,db_hash,release_note) "
-        "VALUES (?,?,?,?,?)",
+        "INSERT INTO dict_versions (version, words_count, db_size_bytes, db_hash, release_note) "
+        "VALUES (%s, %s, %s, %s, %s)",
         (new_v, _word_count(), DICT_PATH.stat().st_size, _file_hash(DICT_PATH), note)
     )
     db.commit()
@@ -333,7 +391,6 @@ def publish_version():
 @app.route("/api/upload_dict", methods=["POST"])
 @require_admin
 def upload_dict():
-    """Загружает dictionary.db на сервер (для первоначальной настройки)."""
     if "file" not in request.files:
         return jsonify({"error": "Файл не найден в запросе"}), 400
     f = request.files["file"]
@@ -341,7 +398,6 @@ def upload_dict():
         return jsonify({"error": "Ожидается .db файл"}), 400
     tmp = BASE_DIR / "dictionary_tmp.db"
     f.save(tmp)
-    # Проверяем что это валидная SQLite БД со словами
     try:
         tc = sqlite3.connect(tmp)
         wc = tc.execute("SELECT COUNT(*) FROM words").fetchone()[0]
@@ -353,13 +409,12 @@ def upload_dict():
         tmp.unlink(missing_ok=True)
         return jsonify({"error": f"Невалидная БД: {e}"}), 400
     tmp.rename(DICT_PATH)
-    # Создаём версию
     db    = get_db()
-    last  = db.execute("SELECT COALESCE(MAX(version),0) FROM dict_versions").fetchone()[0]
+    last  = db.execute("SELECT COALESCE(MAX(version),0) as v FROM dict_versions").fetchone()["v"]
     new_v = last + 1
     db.execute(
-        "INSERT INTO dict_versions (version,words_count,db_size_bytes,db_hash,release_note) "
-        "VALUES (?,?,?,?,?)",
+        "INSERT INTO dict_versions (version, words_count, db_size_bytes, db_hash, release_note) "
+        "VALUES (%s, %s, %s, %s, %s)",
         (new_v, wc, DICT_PATH.stat().st_size, _file_hash(DICT_PATH), "Первоначальная загрузка словаря")
     )
     db.commit()
@@ -370,23 +425,23 @@ def upload_dict():
 @require_admin
 def get_stats():
     db       = get_db()
-    pending  = db.execute("SELECT COUNT(*) FROM pending_words WHERE status='pending'").fetchone()[0]
-    approved = db.execute("SELECT COUNT(*) FROM pending_words WHERE status='approved'").fetchone()[0]
-    rejected = db.execute("SELECT COUNT(*) FROM pending_words WHERE status='rejected'").fetchone()[0]
+    pending  = db.execute("SELECT COUNT(*) as n FROM pending_words WHERE status='pending'").fetchone()["n"]
+    approved = db.execute("SELECT COUNT(*) as n FROM pending_words WHERE status='approved'").fetchone()["n"]
+    rejected = db.execute("SELECT COUNT(*) as n FROM pending_words WHERE status='rejected'").fetchone()["n"]
     version  = db.execute(
-        "SELECT version,words_count,released_at FROM dict_versions ORDER BY version DESC LIMIT 1"
+        "SELECT version, words_count, released_at FROM dict_versions ORDER BY version DESC LIMIT 1"
     ).fetchone()
     recent   = db.execute(
-        "SELECT word,translation,contributor,submitted_at,status "
+        "SELECT word, translation, contributor, submitted_at, status "
         "FROM pending_words ORDER BY submitted_at DESC LIMIT 5"
     ).fetchall()
     return jsonify({
         "pending":      pending,
         "approved":     approved,
         "rejected":     rejected,
-        "dict_version": dict(version) if version else None,
+        "dict_version": _row(version),
         "db_ready":     DICT_PATH.exists(),
-        "recent":       [dict(r) for r in recent],
+        "recent":       _rows(recent),
     })
 
 
@@ -394,33 +449,24 @@ def get_stats():
 
 @app.route("/api/users/login", methods=["POST"])
 def user_login():
-    """Авторизация редактора/администратора через сервер."""
-    data = request.get_json(force=True, silent=True) or {}
+    data     = request.get_json(force=True, silent=True) or {}
     username = data.get("username", "").strip()
     password = data.get("password", "")
     if not username or not password:
         return jsonify({"ok": False, "error": "Укажите логин и пароль"}), 400
-
-    db = get_db()
+    db  = get_db()
     row = db.execute(
-        "SELECT * FROM server_users WHERE username=? AND password_hash=? AND is_active=1",
+        "SELECT * FROM server_users WHERE username=%s AND password_hash=%s AND is_active=1",
         (username, _hash_pw(password))
     ).fetchone()
-
     if not row:
         return jsonify({"ok": False, "error": "Неверный логин или пароль"}), 401
-
-    # Обновляем last_login
-    db.execute(
-        "UPDATE server_users SET last_login=datetime('now') WHERE id=?",
-        (row["id"],)
-    )
+    db.execute("UPDATE server_users SET last_login=NOW() WHERE id=%s", (row["id"],))
     db.commit()
-
     return jsonify({
-        "ok": True,
-        "username": row["username"],
-        "role": row["role"],
+        "ok":        True,
+        "username":  row["username"],
+        "role":      row["role"],
         "full_name": row["full_name"],
     })
 
@@ -428,35 +474,31 @@ def user_login():
 @app.route("/api/users/list", methods=["GET"])
 @require_admin
 def user_list():
-    """Список всех пользователей (только для admin)."""
-    db = get_db()
+    db   = get_db()
     rows = db.execute(
         "SELECT id, username, role, full_name, is_active, created_at, last_login "
         "FROM server_users ORDER BY created_at DESC"
     ).fetchall()
-    return jsonify({"ok": True, "users": [dict(r) for r in rows]})
+    return jsonify({"ok": True, "users": _rows(rows)})
 
 
 @app.route("/api/users/create", methods=["POST"])
 @require_admin
 def user_create():
-    """Создать нового пользователя."""
-    data = request.get_json(force=True, silent=True) or {}
+    data      = request.get_json(force=True, silent=True) or {}
     username  = data.get("username", "").strip()
     password  = data.get("password", "")
     role      = data.get("role", "editor")
     full_name = data.get("full_name", "").strip()
-
     if not username or not password:
         return jsonify({"ok": False, "error": "Укажите логин и пароль"}), 400
     if role not in ("admin", "editor"):
         role = "editor"
-
     db = get_db()
     try:
         db.execute(
             "INSERT INTO server_users (username, password_hash, role, full_name) "
-            "VALUES (?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s)",
             (username, _hash_pw(password), role, full_name)
         )
         db.commit()
@@ -468,23 +510,19 @@ def user_create():
 @app.route("/api/users/update", methods=["POST"])
 @require_admin
 def user_update():
-    """Изменить роль, пароль или активность пользователя."""
     data    = request.get_json(force=True, silent=True) or {}
     user_id = data.get("user_id")
     db      = get_db()
-
     if "password" in data and data["password"]:
-        db.execute(
-            "UPDATE server_users SET password_hash=? WHERE id=?",
-            (_hash_pw(data["password"]), user_id)
-        )
+        db.execute("UPDATE server_users SET password_hash=%s WHERE id=%s",
+                   (_hash_pw(data["password"]), user_id))
     if "role" in data:
-        db.execute("UPDATE server_users SET role=? WHERE id=?", (data["role"], user_id))
+        db.execute("UPDATE server_users SET role=%s WHERE id=%s", (data["role"], user_id))
     if "is_active" in data:
-        db.execute("UPDATE server_users SET is_active=? WHERE id=?",
+        db.execute("UPDATE server_users SET is_active=%s WHERE id=%s",
                    (1 if data["is_active"] else 0, user_id))
     if "full_name" in data:
-        db.execute("UPDATE server_users SET full_name=? WHERE id=?",
+        db.execute("UPDATE server_users SET full_name=%s WHERE id=%s",
                    (data["full_name"], user_id))
     db.commit()
     return jsonify({"ok": True})
@@ -493,13 +531,65 @@ def user_update():
 @app.route("/api/users/delete", methods=["POST"])
 @require_admin
 def user_delete():
-    """Удалить пользователя."""
     data    = request.get_json(force=True, silent=True) or {}
     user_id = data.get("user_id")
     db      = get_db()
-    db.execute("DELETE FROM server_users WHERE id=?", (user_id,))
+    db.execute("DELETE FROM server_users WHERE id=%s", (user_id,))
     db.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/api/users/sync", methods=["POST"])
+@require_admin
+def sync_users():
+    data  = request.get_json(force=True) or {}
+    users = data.get("users", [])
+    db    = get_db()
+    db.execute("DELETE FROM remote_users WHERE username != 'admin'")
+    added = 0
+    for u in users:
+        uname = u.get("username", "").strip()
+        phash = u.get("password_hash", "").strip()
+        role  = u.get("role", "editor")
+        if uname and phash:
+            db.execute("""
+                INSERT INTO remote_users (username, password_hash, role, synced_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (username) DO UPDATE SET
+                    password_hash = EXCLUDED.password_hash,
+                    role          = EXCLUDED.role,
+                    synced_at     = NOW()
+            """, (uname, phash, role))
+            added += 1
+    db.commit()
+    return jsonify({"ok": True, "synced": added})
+
+
+@app.route("/api/users/check", methods=["POST"])
+def check_user():
+    data  = request.get_json(force=True) or {}
+    uname = data.get("username", "").strip()
+    phash = data.get("password_hash", "").strip()
+    if not uname or not phash:
+        return jsonify({"ok": False, "error": "Missing credentials"}), 400
+    db  = get_db()
+    row = db.execute(
+        "SELECT role FROM remote_users WHERE username=%s AND password_hash=%s",
+        (uname, phash)
+    ).fetchone()
+    if row:
+        return jsonify({"ok": True, "role": row["role"]})
+    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
+
+
+@app.route("/api/users", methods=["GET"])
+@require_admin
+def get_users():
+    db   = get_db()
+    rows = db.execute(
+        "SELECT username, password_hash, role FROM remote_users ORDER BY username"
+    ).fetchall()
+    return jsonify({"users": _rows(rows)})
 
 
 # ── Уведомления ──────────────────────────────────────────────────────────────
@@ -517,7 +607,7 @@ def notifications_send():
         target = "all"
     db = get_db()
     db.execute(
-        "INSERT INTO notifications (title, message, target) VALUES (?, ?, ?)",
+        "INSERT INTO notifications (title, message, target) VALUES (%s, %s, %s)",
         (title, message, target)
     )
     db.commit()
@@ -532,7 +622,7 @@ def notifications_list():
         "SELECT id, title, message, target, created_at FROM notifications "
         "ORDER BY created_at DESC LIMIT 100"
     ).fetchall()
-    return jsonify({"ok": True, "notifications": [dict(r) for r in rows]})
+    return jsonify({"ok": True, "notifications": _rows(rows)})
 
 
 @app.route("/api/notifications", methods=["GET"])
@@ -554,92 +644,10 @@ def get_notifications():
             "SELECT id, title, message, target, created_at FROM notifications "
             "WHERE target = 'all' ORDER BY created_at DESC LIMIT 50"
         ).fetchall()
-    return jsonify({"notifications": [dict(r) for r in rows]})
+    return jsonify({"notifications": _rows(rows)})
 
 
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-# ── Управление пользователями (удалённая синхронизация) ───────────────────────
-
-@app.route("/api/users", methods=["GET"])
-@require_admin
-def get_users():
-    """Получить список пользователей (для синхронизации клиентов)."""
-    db = get_db()
-    rows = db.execute(
-        "SELECT username, password_hash, role FROM remote_users ORDER BY username"
-    ).fetchall()
-    return jsonify({"users": [dict(r) for r in rows]})
-
-
-@app.route("/api/users/sync", methods=["POST"])
-@require_admin
-def sync_users():
-    """
-    Принять список пользователей от admin-клиента.
-    Полностью заменяет список на сервере.
-    Body: {"users": [{"username": ..., "password_hash": ..., "role": ...}]}
-    """
-    data  = request.get_json(force=True) or {}
-    users = data.get("users", [])
-
-    db = get_db()
-    # Создаём таблицу если нет
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS remote_users (
-            username      TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            role          TEXT DEFAULT 'editor',
-            synced_at     TEXT DEFAULT (datetime('now'))
-        )
-    """)
-    # Удаляем всех кроме admin
-    db.execute("DELETE FROM remote_users WHERE username != 'admin'")
-    # Вставляем/обновляем
-    added = 0
-    for u in users:
-        uname = u.get("username", "").strip()
-        phash = u.get("password_hash", "").strip()
-        role  = u.get("role", "editor")
-        if uname and phash:
-            db.execute("""
-                INSERT OR REPLACE INTO remote_users (username, password_hash, role, synced_at)
-                VALUES (?, ?, ?, datetime('now'))
-            """, (uname, phash, role))
-            added += 1
-    db.commit()
-    return jsonify({"ok": True, "synced": added})
-
-
-@app.route("/api/users/check", methods=["POST"])
-def check_user():
-    """
-    Проверить логин/пароль пользователя (для удалённого входа).
-    Не требует admin-токен — нужен только username+password_hash.
-    Body: {"username": ..., "password_hash": ...}
-    """
-    data  = request.get_json(force=True) or {}
-    uname = data.get("username", "").strip()
-    phash = data.get("password_hash", "").strip()
-
-    if not uname or not phash:
-        return jsonify({"ok": False, "error": "Missing credentials"}), 400
-
-    db = get_db()
-    # Создаём таблицу если нет
-    try:
-        db.execute("CREATE TABLE IF NOT EXISTS remote_users (username TEXT PRIMARY KEY, password_hash TEXT, role TEXT DEFAULT 'editor', synced_at TEXT)")
-        row = db.execute(
-            "SELECT role FROM remote_users WHERE username=? AND password_hash=?",
-            (uname, phash)
-        ).fetchone()
-    except Exception:
-        row = None
-
-    if row:
-        return jsonify({"ok": True, "role": row["role"]})
-    return jsonify({"ok": False, "error": "Invalid credentials"}), 401
