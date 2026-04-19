@@ -35,9 +35,15 @@ def _resolve_supabase_url(url: str) -> str:
         'us-east-1', 'eu-central-1', 'us-west-1',
         'ap-southeast-1', 'eu-west-2', 'ap-northeast-1',
         'us-east-2', 'sa-east-1', 'ap-southeast-2',
+        'ca-central-1', 'eu-west-3', 'ap-south-1', 'ap-northeast-2',
     ]
     result = [None]
     found = threading.Event()
+
+    def _is_wrong_region(msg: str) -> bool:
+        m = msg.lower()
+        return ('tenant or user not found' in m or 'tenant/user' in m
+                or 'endpoint is disabled' in m or 'enotfound' in m)
 
     def _try(region, port):
         if found.is_set():
@@ -53,12 +59,9 @@ def _resolve_supabase_url(url: str) -> str:
                 result[0] = candidate
                 found.set()
         except psycopg2.OperationalError as e:
-            msg = str(e)
-            # «Tenant not found» = неверный регион; любая другая ошибка = регион верный
-            if 'Tenant or user not found' not in msg and 'endpoint is disabled' not in msg:
-                if not found.is_set():
-                    result[0] = candidate
-                    found.set()
+            if not _is_wrong_region(str(e)) and not found.is_set():
+                result[0] = candidate
+                found.set()
         except Exception:
             pass
 
