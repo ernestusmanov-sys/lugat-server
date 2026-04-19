@@ -150,6 +150,15 @@ def init_db():
             synced_at     TIMESTAMP DEFAULT NOW()
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_releases (
+            id           SERIAL PRIMARY KEY,
+            version      TEXT NOT NULL,
+            download_url TEXT NOT NULL,
+            changelog    TEXT DEFAULT '',
+            released_at  TIMESTAMP DEFAULT NOW()
+        )
+    """)
     # Initial dict version if dictionary.db is present
     cur.execute("SELECT COUNT(*) FROM dict_versions")
     if cur.fetchone()[0] == 0 and DICT_PATH.exists():
@@ -645,6 +654,38 @@ def get_notifications():
             "WHERE target = 'all' ORDER BY created_at DESC LIMIT 50"
         ).fetchall()
     return jsonify({"notifications": _rows(rows)})
+
+
+# ── Обновления приложения ────────────────────────────────────────────────────
+
+@app.route("/api/app/release", methods=["GET"])
+def get_app_release():
+    db  = get_db()
+    row = db.execute(
+        "SELECT version, download_url, changelog, released_at "
+        "FROM app_releases ORDER BY released_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return jsonify({"version": None})
+    return jsonify(_row(row))
+
+
+@app.route("/api/app/release", methods=["POST"])
+@require_admin
+def set_app_release():
+    data         = request.get_json(force=True, silent=True) or {}
+    version      = str(data.get("version",      "")).strip()
+    download_url = str(data.get("download_url", "")).strip()
+    changelog    = str(data.get("changelog",    "")).strip()
+    if not version or not download_url:
+        return jsonify({"ok": False, "error": "Версия и ссылка обязательны"}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO app_releases (version, download_url, changelog) VALUES (%s, %s, %s)",
+        (version, download_url, changelog)
+    )
+    db.commit()
+    return jsonify({"ok": True, "version": version})
 
 
 if __name__ == "__main__":
