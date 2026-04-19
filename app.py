@@ -22,6 +22,22 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "lugat_admin_2024")
 # Supabase / any PostgreSQL — replace "postgres://" prefix for psycopg2 compatibility
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 
+# Render free tier не поддерживает IPv6 — переключаем Supabase на Connection Pooler (IPv4)
+def _fix_supabase_url(url: str) -> str:
+    import re
+    m = re.search(r'://([^:]+):([^@]+)@db\.([a-z0-9]+)\.supabase\.co:(\d+)/(.+)', url)
+    if not m:
+        return url
+    user, password, project_ref, port, dbname = m.groups()
+    # Session pooler (port 5432) использует IPv4
+    return (
+        f"postgresql://postgres.{project_ref}:{password}"
+        f"@aws-0-us-east-1.pooler.supabase.com:5432/{dbname}"
+        f"?sslmode=require"
+    )
+
+DATABASE_URL = _fix_supabase_url(DATABASE_URL)
+
 SERVER_SALT = "lugat_server_users_2024"
 
 
