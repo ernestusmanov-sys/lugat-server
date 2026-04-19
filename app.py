@@ -22,21 +22,57 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "lugat_admin_2024")
 # Supabase / any PostgreSQL — replace "postgres://" prefix for psycopg2 compatibility
 DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 
-# Render free tier не поддерживает IPv6 — переключаем Supabase на Connection Pooler (IPv4)
-def _fix_supabase_url(url: str) -> str:
-    import re
-    m = re.search(r'://([^:]+):([^@]+)@db\.([a-z0-9]+)\.supabase\.co:(\d+)/(.+)', url)
+# Render free tier не поддерживает IPv6 — автоматически находим рабочий Supabase pooler (IPv4)
+def _resolve_supabase_url(url: str) -> str:
+    import re, threading
+    m = re.search(r'://([^:]+):([^@]+)@db\.([a-z0-9]+)\.supabase\.co[:/]', url)
     if not m:
         return url
-    user, password, project_ref, port, dbname = m.groups()
-    # Session pooler (port 5432) использует IPv4
-    return (
-        f"postgresql://postgres.{project_ref}:{password}"
-        f"@aws-0-us-east-1.pooler.supabase.com:5432/{dbname}"
-        f"?sslmode=require"
-    )
+    _, password, project_ref = m.groups()
+    dbname = url.rsplit('/', 1)[-1].split('?')[0] or 'postgres'
 
-DATABASE_URL = _fix_supabase_url(DATABASE_URL)
+    regions = [
+        'us-east-1', 'eu-central-1', 'us-west-1',
+        'ap-southeast-1', 'eu-west-2', 'ap-northeast-1',
+        'us-east-2', 'sa-east-1', 'ap-southeast-2',
+    ]
+    result = [None]
+    found = threading.Event()
+
+    def _try(region, port):
+        if found.is_set():
+            return
+        candidate = (
+            f"postgresql://postgres.{project_ref}:{password}"
+            f"@aws-0-{region}.pooler.supabase.com:{port}/{dbname}?sslmode=require"
+        )
+        try:
+            c = psycopg2.connect(candidate, connect_timeout=6)
+            c.close()
+            if not found.is_set():
+                result[0] = candidate
+                found.set()
+        except psycopg2.OperationalError as e:
+            msg = str(e)
+            # «Tenant not found» = неверный регион; любая другая ошибка = регион верный
+            if 'Tenant or user not found' not in msg and 'endpoint is disabled' not in msg:
+                if not found.is_set():
+                    result[0] = candidate
+                    found.set()
+        except Exception:
+            pass
+
+    threads = []
+    for region in regions:
+        for port in (6543, 5432):
+            t = threading.Thread(target=_try, args=(region, port), daemon=True)
+            threads.append(t)
+            t.start()
+
+    found.wait(timeout=20)
+    return result[0] if result[0] else url
+
+DATABASE_URL = _resolve_supabase_url(DATABASE_URL)
 
 SERVER_SALT = "lugat_server_users_2024"
 
