@@ -43,14 +43,10 @@ def _gh_headers():
 
 def _gh_load_users() -> list:
     """Загружает пользователей из GitHub. Возвращает [] при ошибке."""
-    if not _GH_TOKEN:
-        return []
     try:
-        url = f"https://api.github.com/repos/{_GH_REPO}/contents/{_GH_FILE}"
-        with urlopen(Request(url, headers=_gh_headers()), timeout=10) as r:
-            data = _json.loads(r.read())
-        content = _json.loads(_b64.b64decode(data["content"]).decode())
-        return content.get("users", [])
+        url = f"https://raw.githubusercontent.com/{_GH_REPO}/main/{_GH_FILE}"
+        with urlopen(Request(url, headers={"User-Agent": "Lugat/1.0"}), timeout=15) as r:
+            return _json.loads(r.read()).get("users", [])
     except Exception:
         return []
 
@@ -80,14 +76,11 @@ def _gh_save_users(users: list):
 
 
 def _gh_load_extra(table: str) -> list:
-    """Загружает phraseology или collocations из GitHub."""
-    if not _GH_TOKEN:
-        return []
+    """Загружает phraseology или collocations из GitHub (raw URL — без лимита размера)."""
     try:
-        url = f"https://api.github.com/repos/{_GH_REPO}/contents/server_data/{table}.json"
-        with urlopen(Request(url, headers=_gh_headers()), timeout=10) as r:
-            data = _json.loads(r.read())
-        return _json.loads(_b64.b64decode(data["content"]).decode()).get("rows", [])
+        url = f"https://raw.githubusercontent.com/{_GH_REPO}/main/server_data/{table}.json"
+        with urlopen(Request(url, headers={"User-Agent": "Lugat/1.0"}), timeout=30) as r:
+            return _json.loads(r.read()).get("rows", [])
     except Exception:
         return []
 
