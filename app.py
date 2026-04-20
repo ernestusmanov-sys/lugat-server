@@ -144,6 +144,30 @@ def init_db():
                 "VALUES (1, ?, ?, ?, 'Начальная версия')",
                 (wc, DICT_PATH.stat().st_size, _file_hash(DICT_PATH))
             )
+    # Seed server users from env var SEED_USERS (JSON array) on every startup.
+    # Format: [{"username":"admin","password":"secret","role":"admin","full_name":"Админ"}, ...]
+    # This ensures accounts survive Render redeploys (ephemeral filesystem).
+    seed_json = os.environ.get("SEED_USERS", "")
+    if seed_json:
+        try:
+            import json as _json
+            for u in _json.loads(seed_json):
+                uname = u.get("username", "").strip()
+                pw    = u.get("password", "")
+                role  = u.get("role", "editor")
+                fname = u.get("full_name", "")
+                if not uname or not pw:
+                    continue
+                conn.execute("""
+                    INSERT INTO server_users (username, password_hash, role, full_name)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(username) DO UPDATE SET
+                        password_hash = excluded.password_hash,
+                        role          = excluded.role,
+                        full_name     = excluded.full_name
+                """, (uname, _hash_pw(pw), role, fname))
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
