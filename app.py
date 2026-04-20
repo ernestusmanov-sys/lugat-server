@@ -79,6 +79,42 @@ def _gh_save_users(users: list):
         pass
 
 
+def _gh_load_extra(table: str) -> list:
+    """Загружает phraseology или collocations из GitHub."""
+    if not _GH_TOKEN:
+        return []
+    try:
+        url = f"https://api.github.com/repos/{_GH_REPO}/contents/server_data/{table}.json"
+        with urlopen(Request(url, headers=_gh_headers()), timeout=10) as r:
+            data = _json.loads(r.read())
+        return _json.loads(_b64.b64decode(data["content"]).decode()).get("rows", [])
+    except Exception:
+        return []
+
+
+def _gh_save_extra(table: str, rows: list):
+    """Сохраняет phraseology или collocations в GitHub."""
+    if not _GH_TOKEN:
+        return
+    try:
+        url = f"https://api.github.com/repos/{_GH_REPO}/contents/server_data/{table}.json"
+        sha = None
+        try:
+            with urlopen(Request(url, headers=_gh_headers()), timeout=10) as r:
+                sha = _json.loads(r.read())["sha"]
+        except Exception:
+            pass
+        content = _json.dumps({"rows": rows}, ensure_ascii=False, indent=2)
+        payload = {"message": f"chore: update {table}", "content": _b64.b64encode(content.encode()).decode()}
+        if sha:
+            payload["sha"] = sha
+        body = _json.dumps(payload).encode()
+        req = Request(url, data=body, headers={**_gh_headers(), "Content-Type": "application/json"}, method="PUT")
+        urlopen(req, timeout=20)
+    except Exception:
+        pass
+
+
 def _hash_pw(password: str) -> str:
     return hashlib.sha256(f"{SERVER_SALT}{password}".encode()).hexdigest()
 
@@ -191,6 +227,32 @@ def init_db():
             changelog    TEXT DEFAULT '',
             released_at  TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS phraseology (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            crimean_tatar TEXT NOT NULL,
+            russian       TEXT NOT NULL,
+            definition    TEXT DEFAULT '',
+            example       TEXT DEFAULT '',
+            category      TEXT DEFAULT '',
+            is_verified   INTEGER DEFAULT 0,
+            entry_lang    TEXT DEFAULT 'ct',
+            created_at    TEXT DEFAULT (datetime('now')),
+            updated_at    TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS collocations (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            crimean_tatar TEXT NOT NULL,
+            russian       TEXT NOT NULL,
+            definition    TEXT DEFAULT '',
+            example       TEXT DEFAULT '',
+            category      TEXT DEFAULT '',
+            is_verified   INTEGER DEFAULT 0,
+            entry_lang    TEXT DEFAULT 'ct',
+            created_at    TEXT DEFAULT (datetime('now')),
+            updated_at    TEXT DEFAULT (datetime('now'))
+        );
     """)
     # Initial dict version if dictionary.db is present and no versions exist
     if DICT_PATH.exists():
@@ -221,6 +283,22 @@ def init_db():
                 full_name     = excluded.full_name,
                 is_active     = excluded.is_active
         """, (uname, phash, role, fname, active))
+    conn.commit()
+
+    # Загружаем phraseology и collocations из GitHub
+    for table in ("phraseology", "collocations"):
+        rows = _gh_load_extra(table)
+        if rows:
+            conn.execute(f"DELETE FROM {table}")
+            for r in rows:
+                conn.execute(
+                    f"INSERT INTO {table} (crimean_tatar, russian, definition, example, "
+                    f"category, is_verified, entry_lang) VALUES (?,?,?,?,?,?,?)",
+                    (r.get("crimean_tatar",""), r.get("russian",""),
+                     r.get("definition",""), r.get("example",""),
+                     r.get("category",""), r.get("is_verified",0),
+                     r.get("entry_lang","ct"))
+                )
     conn.commit()
     conn.close()
 
@@ -750,6 +828,48 @@ def set_app_release():
     )
     db.commit()
     return jsonify({"ok": True, "version": version})
+
+
+# ── Фразеологизмы и словосочетания ───────────────────────────────────────────
+
+def _extra_rows(db, table: str) -> list:
+    rows = db.execute(
+        f"SELECT crimean_tatar, russian, definition, example, category, "
+        f"is_verified, entry_lang, created_at, updated_at FROM {table} "
+        f"ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.route("/api/extra/<table>", methods=["GET"])
+def get_extra(table):
+    if table not in ("phraseology", "collocations"):
+        return jsonify({"error": "Not found"}), 404
+    db = get_db()
+    return jsonify({"ok": True, "rows": _extra_rows(db, table)})
+
+
+@app.route("/api/extra/<table>/sync", methods=["POST"])
+@require_admin
+def sync_extra(table):
+    if table not in ("phraseology", "collocations"):
+        return jsonify({"error": "Not found"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    rows = data.get("rows", [])
+    db   = get_db()
+    db.execute(f"DELETE FROM {table}")
+    for r in rows:
+        db.execute(
+            f"INSERT INTO {table} (crimean_tatar, russian, definition, example, "
+            f"category, is_verified, entry_lang) VALUES (?,?,?,?,?,?,?)",
+            (r.get("crimean_tatar",""), r.get("russian",""),
+             r.get("definition",""), r.get("example",""),
+             r.get("category",""), r.get("is_verified",0),
+             r.get("entry_lang","ct"))
+        )
+    db.commit()
+    _gh_save_extra(table, _extra_rows(db, table))
+    return jsonify({"ok": True, "synced": len(rows)})
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
