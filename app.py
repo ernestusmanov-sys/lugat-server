@@ -1,12 +1,15 @@
 """
-Lugat — Центральный сервер краудсорсинга (SQLite)
+Lugat — Центральный сервер краудсорсинга (SQLite + GitHub persistence)
 """
 import os
 import hashlib
 import sqlite3
+import json as _json
+import base64 as _b64
 from pathlib import Path
 from functools import wraps
-from contextlib import contextmanager
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError
 
 from flask import Flask, request, jsonify, send_file, g
 from flask_cors import CORS
@@ -19,6 +22,57 @@ DICT_PATH   = BASE_DIR / "dictionary.db"
 SERVER_DB   = BASE_DIR / "server.db"
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "lugat_admin_2024")
 SERVER_SALT = "lugat_server_users_2024"
+
+# GitHub-персистентность пользователей
+_GH_TOKEN = os.environ.get("GH_TOKEN", "")
+_GH_REPO  = os.environ.get("GH_REPO", "ernestusmanov-sys/lugat-server")
+_GH_FILE  = "server_data/users.json"
+
+
+def _gh_headers():
+    return {
+        "Authorization": f"token {_GH_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Lugat/1.0",
+    }
+
+
+def _gh_load_users() -> list:
+    """Загружает пользователей из GitHub. Возвращает [] при ошибке."""
+    if not _GH_TOKEN:
+        return []
+    try:
+        url = f"https://api.github.com/repos/{_GH_REPO}/contents/{_GH_FILE}"
+        with urlopen(Request(url, headers=_gh_headers()), timeout=10) as r:
+            data = _json.loads(r.read())
+        content = _json.loads(_b64.b64decode(data["content"]).decode())
+        return content.get("users", [])
+    except Exception:
+        return []
+
+
+def _gh_save_users(users: list):
+    """Сохраняет список пользователей в GitHub."""
+    if not _GH_TOKEN:
+        return
+    try:
+        url = f"https://api.github.com/repos/{_GH_REPO}/contents/{_GH_FILE}"
+        # Получаем текущий SHA файла
+        with urlopen(Request(url, headers=_gh_headers()), timeout=10) as r:
+            current = _json.loads(r.read())
+        sha = current["sha"]
+        content = _json.dumps({"users": users}, ensure_ascii=False, indent=2)
+        body = _json.dumps({
+            "message": "chore: update server users",
+            "content": _b64.b64encode(content.encode()).decode(),
+            "sha": sha,
+        }).encode()
+        req = Request(url, data=body,
+                      headers={**_gh_headers(), "Content-Type": "application/json"},
+                      method="PUT")
+        urlopen(req, timeout=15)
+    except Exception:
+        pass
 
 
 def _hash_pw(password: str) -> str:
@@ -144,30 +198,25 @@ def init_db():
                 "VALUES (1, ?, ?, ?, 'Начальная версия')",
                 (wc, DICT_PATH.stat().st_size, _file_hash(DICT_PATH))
             )
-    # Seed server users from env var SEED_USERS (JSON array) on every startup.
-    # Format: [{"username":"admin","password":"secret","role":"admin","full_name":"Админ"}, ...]
-    # This ensures accounts survive Render redeploys (ephemeral filesystem).
-    seed_json = os.environ.get("SEED_USERS", "")
-    if seed_json:
-        try:
-            import json as _json
-            for u in _json.loads(seed_json):
-                uname = u.get("username", "").strip()
-                pw    = u.get("password", "")
-                role  = u.get("role", "editor")
-                fname = u.get("full_name", "")
-                if not uname or not pw:
-                    continue
-                conn.execute("""
-                    INSERT INTO server_users (username, password_hash, role, full_name)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(username) DO UPDATE SET
-                        password_hash = excluded.password_hash,
-                        role          = excluded.role,
-                        full_name     = excluded.full_name
-                """, (uname, _hash_pw(pw), role, fname))
-        except Exception:
-            pass
+    # Загружаем пользователей из GitHub (persistent storage)
+    gh_users = _gh_load_users()
+    for u in gh_users:
+        uname = u.get("username", "").strip()
+        phash = u.get("password_hash", "").strip()
+        role  = u.get("role", "editor")
+        fname = u.get("full_name", "")
+        active = u.get("is_active", 1)
+        if not uname or not phash:
+            continue
+        conn.execute("""
+            INSERT INTO server_users (username, password_hash, role, full_name, is_active)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                role          = excluded.role,
+                full_name     = excluded.full_name,
+                is_active     = excluded.is_active
+        """, (uname, phash, role, fname, active))
     conn.commit()
     conn.close()
 
@@ -494,6 +543,14 @@ def user_list():
     return jsonify({"ok": True, "users": _rows(rows)})
 
 
+def _persist_users(db):
+    """Читает server_users из SQLite и сохраняет в GitHub."""
+    rows = db.execute(
+        "SELECT username, password_hash, role, full_name, is_active FROM server_users"
+    ).fetchall()
+    _gh_save_users([dict(r) for r in rows])
+
+
 @app.route("/api/users/create", methods=["POST"])
 @require_admin
 def user_create():
@@ -514,6 +571,7 @@ def user_create():
             (username, _hash_pw(password), role, full_name)
         )
         db.commit()
+        _persist_users(db)
         return jsonify({"ok": True, "message": f"Пользователь {username!r} создан"})
     except sqlite3.IntegrityError:
         return jsonify({"ok": False, "error": "Пользователь уже существует"}), 409
@@ -537,6 +595,7 @@ def user_update():
         db.execute("UPDATE server_users SET full_name=? WHERE id=?",
                    (data["full_name"], user_id))
     db.commit()
+    _persist_users(db)
     return jsonify({"ok": True})
 
 
@@ -548,6 +607,7 @@ def user_delete():
     db      = get_db()
     db.execute("DELETE FROM server_users WHERE id=?", (user_id,))
     db.commit()
+    _persist_users(db)
     return jsonify({"ok": True})
 
 
