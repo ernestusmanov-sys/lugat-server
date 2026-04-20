@@ -20,6 +20,13 @@
       "role": "editor",
       "full_name": "Ленияр Сабриевна",
       "is_active": 1
+    },
+    {
+      "username": "Incife",
+      "password_hash": "09c5f2564b0c3eaaf90a856bcac0545cafcd7a6139b990dcb3c630c7b03160df",
+      "role": "editor",
+      "full_name": "Инджифе",
+      "is_active": 1
     }
   ]
 }
