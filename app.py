@@ -225,10 +225,21 @@ def init_db():
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             message      TEXT NOT NULL,
             contact      TEXT DEFAULT '',
+            device_id    TEXT DEFAULT '',
             submitted_at TEXT DEFAULT (datetime('now')),
             ip_address   TEXT DEFAULT '',
             is_read      INTEGER DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS feedback_replies (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            feedback_id  INTEGER NOT NULL,
+            device_id    TEXT NOT NULL,
+            reply        TEXT NOT NULL,
+            created_at   TEXT DEFAULT (datetime('now')),
+            is_delivered INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_replies_device ON feedback_replies(device_id, is_delivered);
 
         CREATE TABLE IF NOT EXISTS phraseology (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -804,16 +815,17 @@ def get_notifications():
 
 @app.route("/api/feedback", methods=["POST"])
 def submit_feedback():
-    data    = request.get_json(force=True, silent=True) or {}
-    message = str(data.get("message", "")).strip()
-    contact = str(data.get("contact", "")).strip()
+    data      = request.get_json(force=True, silent=True) or {}
+    message   = str(data.get("message",   "")).strip()
+    contact   = str(data.get("contact",   "")).strip()
+    device_id = str(data.get("device_id", "")).strip()
     if not message:
         return jsonify({"error": "Сообщение не может быть пустым"}), 400
     ip = request.remote_addr or ""
     db = get_db()
     db.execute(
-        "INSERT INTO feedback (message, contact, ip_address) VALUES (?, ?, ?)",
-        (message, contact, ip)
+        "INSERT INTO feedback (message, contact, device_id, ip_address) VALUES (?, ?, ?, ?)",
+        (message, contact, device_id, ip)
     )
     db.commit()
     return jsonify({"ok": True}), 201
@@ -824,7 +836,9 @@ def submit_feedback():
 def get_feedback_list():
     db   = get_db()
     rows = db.execute(
-        "SELECT * FROM feedback ORDER BY submitted_at DESC LIMIT 200"
+        "SELECT f.*, "
+        "(SELECT COUNT(*) FROM feedback_replies r WHERE r.feedback_id=f.id) as reply_count "
+        "FROM feedback f ORDER BY f.submitted_at DESC LIMIT 200"
     ).fetchall()
     unread = db.execute(
         "SELECT COUNT(*) FROM feedback WHERE is_read=0"
@@ -839,6 +853,52 @@ def mark_feedback_read(fid):
     db.execute("UPDATE feedback SET is_read=1 WHERE id=?", (fid,))
     db.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/api/feedback/<int:fid>/reply", methods=["POST"])
+@require_admin
+def reply_feedback(fid):
+    data  = request.get_json(force=True, silent=True) or {}
+    reply = str(data.get("reply", "")).strip()
+    if not reply:
+        return jsonify({"error": "Текст ответа не может быть пустым"}), 400
+    db  = get_db()
+    row = db.execute("SELECT device_id FROM feedback WHERE id=?", (fid,)).fetchone()
+    if not row:
+        return jsonify({"error": "Сообщение не найдено"}), 404
+    device_id = dict(row)["device_id"]
+    if not device_id:
+        return jsonify({"error": "У пользователя нет device_id — ответ недоставим"}), 400
+    db.execute(
+        "INSERT INTO feedback_replies (feedback_id, device_id, reply) VALUES (?, ?, ?)",
+        (fid, device_id, reply)
+    )
+    db.execute("UPDATE feedback SET is_read=1 WHERE id=?", (fid,))
+    db.commit()
+    return jsonify({"ok": True}), 201
+
+
+@app.route("/api/feedback/replies")
+def get_replies():
+    """Мобильный клиент запрашивает ответы по своему device_id."""
+    device_id = request.args.get("device_id", "").strip()
+    if not device_id:
+        return jsonify({"error": "device_id required"}), 400
+    db   = get_db()
+    rows = db.execute(
+        "SELECT r.id, r.reply, r.created_at, f.message as original_message "
+        "FROM feedback_replies r JOIN feedback f ON f.id=r.feedback_id "
+        "WHERE r.device_id=? AND r.is_delivered=0 ORDER BY r.created_at",
+        (device_id,)
+    ).fetchall()
+    if rows:
+        ids = [dict(r)["id"] for r in rows]
+        db.execute(
+            f"UPDATE feedback_replies SET is_delivered=1 WHERE id IN ({','.join('?'*len(ids))})",
+            ids
+        )
+        db.commit()
+    return jsonify({"replies": _rows(rows)})
 
 
 # ── Обновления приложения ─────────────────────────────────────────────────────
