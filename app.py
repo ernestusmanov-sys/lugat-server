@@ -878,6 +878,16 @@ def reply_feedback(fid):
     return jsonify({"ok": True}), 201
 
 
+@app.route("/api/feedback/replies/resend/<int:rid>", methods=["POST"])
+@require_admin
+def resend_reply(rid):
+    """Сбросить флаг доставки — для повторной отправки ответа."""
+    db = get_db()
+    db.execute("UPDATE feedback_replies SET is_delivered=0 WHERE id=?", (rid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/feedback/replies")
 def get_replies():
     """Мобильный клиент запрашивает ответы по своему device_id."""
