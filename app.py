@@ -221,6 +221,15 @@ def init_db():
             released_at  TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS feedback (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            message      TEXT NOT NULL,
+            contact      TEXT DEFAULT '',
+            submitted_at TEXT DEFAULT (datetime('now')),
+            ip_address   TEXT DEFAULT '',
+            is_read      INTEGER DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS phraseology (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             crimean_tatar TEXT NOT NULL,
@@ -791,7 +800,63 @@ def get_notifications():
     return jsonify({"notifications": _rows(rows)})
 
 
+# ── Обратная связь ───────────────────────────────────────────────────────────
+
+@app.route("/api/feedback", methods=["POST"])
+def submit_feedback():
+    data    = request.get_json(force=True, silent=True) or {}
+    message = str(data.get("message", "")).strip()
+    contact = str(data.get("contact", "")).strip()
+    if not message:
+        return jsonify({"error": "Сообщение не может быть пустым"}), 400
+    ip = request.remote_addr or ""
+    db = get_db()
+    db.execute(
+        "INSERT INTO feedback (message, contact, ip_address) VALUES (?, ?, ?)",
+        (message, contact, ip)
+    )
+    db.commit()
+    return jsonify({"ok": True}), 201
+
+
+@app.route("/api/feedback_list")
+@require_admin
+def get_feedback_list():
+    db   = get_db()
+    rows = db.execute(
+        "SELECT * FROM feedback ORDER BY submitted_at DESC LIMIT 200"
+    ).fetchall()
+    unread = db.execute(
+        "SELECT COUNT(*) FROM feedback WHERE is_read=0"
+    ).fetchone()[0]
+    return jsonify({"items": _rows(rows), "unread": unread})
+
+
+@app.route("/api/feedback/<int:fid>/read", methods=["POST"])
+@require_admin
+def mark_feedback_read(fid):
+    db = get_db()
+    db.execute("UPDATE feedback SET is_read=1 WHERE id=?", (fid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
 # ── Обновления приложения ─────────────────────────────────────────────────────
+
+APP_VERSION = "1.5.0"
+APP_BUILD   = 5
+
+
+@app.route("/api/app_version")
+def get_app_version():
+    """Backward-compat endpoint for mobile client."""
+    db  = get_db()
+    row = db.execute(
+        "SELECT version FROM app_releases ORDER BY released_at DESC LIMIT 1"
+    ).fetchone()
+    latest = dict(row)["version"] if row else APP_VERSION
+    return jsonify({"version": latest, "build": APP_BUILD})
+
 
 @app.route("/api/app/release", methods=["GET"])
 def get_app_release():
