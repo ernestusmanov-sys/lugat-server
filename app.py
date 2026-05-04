@@ -241,6 +241,17 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_replies_device ON feedback_replies(device_id, is_delivered);
 
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id  TEXT NOT NULL,
+            sender     TEXT NOT NULL CHECK(sender IN ('user','admin')),
+            message    TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            is_read    INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_device ON chat_messages(device_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_unread ON chat_messages(sender, is_read);
+
         CREATE TABLE IF NOT EXISTS phraseology (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             crimean_tatar TEXT NOT NULL,
@@ -909,6 +920,99 @@ def get_replies():
         )
         db.commit()
     return jsonify({"replies": _rows(rows)})
+
+
+# ── Чат поддержки ────────────────────────────────────────────────────────────
+
+@app.route("/api/chat", methods=["GET"])
+def chat_get():
+    """Мобильный клиент: получить историю чата."""
+    device_id = request.args.get("device_id", "").strip()
+    if not device_id:
+        return jsonify({"error": "device_id required"}), 400
+    since = request.args.get("since", "")
+    db = get_db()
+    if since:
+        rows = db.execute(
+            "SELECT id, sender, message, created_at, is_read FROM chat_messages "
+            "WHERE device_id=? AND created_at > ? ORDER BY created_at",
+            (device_id, since)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, sender, message, created_at, is_read FROM chat_messages "
+            "WHERE device_id=? ORDER BY created_at LIMIT 200",
+            (device_id,)
+        ).fetchall()
+    # Помечаем сообщения от admin как прочитанные
+    db.execute(
+        "UPDATE chat_messages SET is_read=1 WHERE device_id=? AND sender='admin' AND is_read=0",
+        (device_id,)
+    )
+    db.commit()
+    return jsonify({"messages": _rows(rows)})
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat_post():
+    """Мобильный клиент: отправить сообщение."""
+    data      = request.get_json(force=True, silent=True) or {}
+    device_id = str(data.get("device_id", "")).strip()
+    message   = str(data.get("message",   "")).strip()
+    if not device_id or not message:
+        return jsonify({"error": "device_id и message обязательны"}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO chat_messages (device_id, sender, message) VALUES (?, 'user', ?)",
+        (device_id, message)
+    )
+    db.commit()
+    return jsonify({"ok": True}), 201
+
+
+@app.route("/api/chat/reply", methods=["POST"])
+@require_admin
+def chat_reply():
+    """Админ: отправить ответ пользователю."""
+    data      = request.get_json(force=True, silent=True) or {}
+    device_id = str(data.get("device_id", "")).strip()
+    message   = str(data.get("message",   "")).strip()
+    if not device_id or not message:
+        return jsonify({"error": "device_id и message обязательны"}), 400
+    db = get_db()
+    db.execute(
+        "INSERT INTO chat_messages (device_id, sender, message) VALUES (?, 'admin', ?)",
+        (device_id, message)
+    )
+    # Помечаем сообщения от user как прочитанные
+    db.execute(
+        "UPDATE chat_messages SET is_read=1 WHERE device_id=? AND sender='user' AND is_read=0",
+        (device_id,)
+    )
+    db.commit()
+    return jsonify({"ok": True}), 201
+
+
+@app.route("/api/chat/conversations")
+@require_admin
+def chat_conversations():
+    """Админ: список всех бесед (последнее сообщение + кол-во непрочитанных)."""
+    db   = get_db()
+    rows = db.execute("""
+        SELECT
+            device_id,
+            MAX(created_at) as last_at,
+            COUNT(*) as total,
+            SUM(CASE WHEN sender='user' AND is_read=0 THEN 1 ELSE 0 END) as unread,
+            (SELECT message FROM chat_messages m2
+             WHERE m2.device_id=m.device_id ORDER BY created_at DESC LIMIT 1) as last_message,
+            (SELECT sender FROM chat_messages m3
+             WHERE m3.device_id=m.device_id ORDER BY created_at DESC LIMIT 1) as last_sender
+        FROM chat_messages m
+        GROUP BY device_id
+        ORDER BY last_at DESC
+    """).fetchall()
+    return jsonify({"conversations": _rows(rows)})
 
 
 # ── Обновления приложения ─────────────────────────────────────────────────────
